@@ -13,7 +13,7 @@ class Group extends Model
     use HasFactory;
 
     protected $fillable = [
-        'event_id',     // ✅ added — needed for donor lookup
+        'event_id',     // ← added
         'round_id',
         'group_name',
         'min_amount',
@@ -46,10 +46,10 @@ class Group extends Model
         return $this->hasManyThrough(
             Bid::class,
             GroupMember::class,
-            'group_id', // FK on group_members
-            'id',       // FK on bids
-            'id',       // local key on groups
-            'bid_id'    // local key on group_members
+            'group_id',
+            'id',
+            'id',
+            'bid_id'
         );
     }
 }

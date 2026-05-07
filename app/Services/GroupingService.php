@@ -12,9 +12,13 @@ class GroupingService
     {
         // Get all bids for this round sorted by amount descending
         // is_quit check removed — bids table may not have is_quit column
-        $bids = $round->bids()
+        /*$bids = $round->bids()
             ->orderByDesc('amount')
-            ->get();
+            ->get();*/
+		$bids = $round->bids()
+            ->get()
+            ->shuffle()   // ← was orderByDesc('amount'), now random
+            ->values();
 
         if ($bids->isEmpty()) {
             return [];

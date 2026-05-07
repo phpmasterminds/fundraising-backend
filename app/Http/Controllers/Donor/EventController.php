@@ -17,13 +17,11 @@ class EventController extends Controller
         $user = $request->user();
         $tab  = $request->query('tab', 'upcoming');
 
-        $myEventIds = $this->getMyEventIds($user->id);
-
         $statuses = $tab === 'upcoming' ? ['live', 'draft'] : ['finished'];
 
-        $events = Event::whereIn('id', $myEventIds)
-            ->whereIn('status', $statuses)
-            ->latest()
+        $events = Event::whereIn('status', $statuses)
+            ->orderByRaw("FIELD(status, 'live', 'draft', 'finished')")
+            ->orderBy('started_at', 'asc')
             ->get()
             ->map(fn($e) => $this->formatListItem($e, $user->id));
 
@@ -126,8 +124,8 @@ class EventController extends Controller
 
         \App\Models\GroupMember::create([
             'event_id'       => $id,
-            'group_id'       => null,   // assigned when round closes & grouping runs
-            'bid_id'         => null,   // assigned when round closes & grouping runs
+            'group_id'       => null,
+            'bid_id'         => null,
             'user_id'        => $user->id,
             'pseudonym'      => $request->filled('pseudonym')
                                     ? $request->pseudonym
@@ -155,19 +153,10 @@ class EventController extends Controller
             ->count('user_id');
     }
 
-    private function getMyEventIds(int $userId): array
-    {
-        return \App\Models\GroupMember::where('user_id', $userId)
-            ->pluck('event_id')
-            ->unique()
-            ->toArray();
-    }
-
     private function formatListItem(Event $e, int $userId): array
     {
-        $images   = $e->images;
+        $images = $e->images;
         if (is_string($images)) $images = json_decode($images, true) ?? [];
-        $isMember = (bool) $this->findMember((int) $e->id, $userId);
 
         return [
             'id'           => $e->id,
@@ -180,7 +169,7 @@ class EventController extends Controller
             'rounds_count' => (int) $e->rounds_count,
             'donors_count' => $this->countDonors((int) $e->id),
             'join_code'    => $e->join_code,
-            'is_member'    => $isMember,
+            'is_member'    => (bool) $this->findMember((int) $e->id, $userId),
         ];
     }
 
@@ -189,7 +178,6 @@ class EventController extends Controller
         $myBid   = Bid::where('round_id', $round->id)->where('user_id', $user->id)->first();
         $allBids = Bid::where('round_id', $round->id)->orderBy('amount')->get();
 
-        // Elapsed seconds since round opened (counts UP from 00:00)
         $secondsLeft = null;
         if ($round->status === 'open' && $round->opened_at) {
             $secondsLeft = (int) $round->opened_at->diffInSeconds(now());
@@ -218,33 +206,32 @@ class EventController extends Controller
         $cumulative = $this->calcCumulative((int) $event->id, (int) $user->id, $round->round_number);
         $groupSize  = (int) $event->group_size;
 
-        // ✅ Real my_group — lookup via GroupMember after grouping runs
+        // ── Build my_group ─────────────────────────────────────────────
+        //
+        // CLOSED round → show THIS round's group (grouping just ran)
+        // OPEN round   → show PREVIOUS closed round's group with CURRENT
+        //                round bid statuses (shows who you're bidding with)
+        // Round 1 open → null (GroupCard shows "Waiting for others")
+
         $myGroup = null;
-        $member  = \App\Models\GroupMember::where('event_id', $event->id)
-            ->where('user_id', $user->id)
-            ->whereNotNull('group_id')
-            ->with(['group.members'])
-            ->first();
 
-        if ($member && $member->group) {
-            $group = $member->group;
+        if ($round->status === 'closed') {
+            $myGroup = $this->buildMyGroup($event->id, $user->id, $round->id, $round->id);
 
-            // Only show group info for the current round's group
-            if ($group->round_id === $round->id) {
-                $members = $group->members->map(function ($m) use ($user) {
-                    return [
-                        'pseudonym'  => $m->pseudonym ?? 'Donor',
-                        'initial'    => mb_strtoupper(mb_substr($m->pseudonym ?? 'D', 0, 1)),
-                        'emoji'      => $m->emoji,
-                        'is_you'     => $m->user_id === $user->id,
-                        'bid_status' => $m->bid_id ? 'submitted' : 'waiting',
-                    ];
-                })->values()->toArray();
+        } elseif ($round->status === 'open') {
+            $prevRound = Round::where('event_id', $event->id)
+                ->where('status', 'closed')
+                ->orderByDesc('round_number')
+                ->first();
 
-                $myGroup = [
-                    'name'    => $group->group_name,
-                    'members' => $members,
-                ];
+            if ($prevRound) {
+                // Show prev round's group but mark bid_status against current round
+                $myGroup = $this->buildMyGroup(
+                    $event->id,
+                    $user->id,
+                    $prevRound->id,   // group assignment from prev round
+                    $round->id        // bid status from current open round
+                );
             }
         }
 
@@ -262,6 +249,56 @@ class EventController extends Controller
             'my_cumulative'  => $cumulative,
             'round_bids'     => $roundBids,
         ];
+    }
+
+    /**
+     * Builds the my_group payload.
+     *
+     * @param int $groupRoundId  closed round whose grouping to look up
+     * @param int $bidRoundId    round to check bid_status against (may differ during open round)
+     */
+    private function buildMyGroup(int $eventId, int $userId, int $groupRoundId, int $bidRoundId): ?array
+    {
+        $member = \App\Models\GroupMember::where('event_id', $eventId)
+            ->where('user_id', $userId)
+            ->whereHas('group', fn($q) => $q->where('round_id', $groupRoundId))
+            ->with(['group.members'])
+            ->first();
+
+        if (!$member || !$member->group) {
+            return null;
+        }
+
+        $group = $member->group;
+
+        // Who in this group has already bid in the current round?
+        $bidsThisRound = Bid::where('round_id', $bidRoundId)
+            ->whereIn('user_id', $group->members->pluck('user_id'))
+            ->pluck('user_id')
+            ->toArray();
+
+        $members = $group->members->map(function ($m) use ($userId, $bidsThisRound) {
+            return [
+                'pseudonym'  => $m->pseudonym ?? 'Donor',
+                'initial'    => mb_strtoupper(mb_substr($m->pseudonym ?? 'D', 0, 1)),
+                'emoji'      => $m->emoji,
+                'is_you'     => $m->user_id === $userId,
+                'bid_status' => in_array($m->user_id, $bidsThisRound) ? 'submitted' : 'bidding',
+            ];
+        })->values()->toArray();
+
+        return [
+            'name'    => $group->group_name,
+            'members' => $members,
+        ];
+    }
+
+    private function getMyEventIds(int $userId): array
+    {
+        return \App\Models\GroupMember::where('user_id', $userId)
+            ->pluck('event_id')
+            ->unique()
+            ->toArray();
     }
 
     private function calcCumulative(int $eventId, int $userId, int $upToRound): int
