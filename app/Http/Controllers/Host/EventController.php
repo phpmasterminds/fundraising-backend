@@ -15,13 +15,24 @@ use Illuminate\Support\Facades\Storage;
 
 class EventController extends Controller
 {
-    // GET /api/host/events
+    // GET /api/host/events?tab=upcoming|finished|unlisted
     public function index(Request $request)
     {
-        $events = Event::where('host_id', $request->user()->id)
+        $tab = $request->query('tab', 'upcoming');
+
+        $query = Event::where('host_id', $request->user()->id)
             ->withCount('rounds')
-            ->latest()
-            ->get()
+            ->latest();
+
+        if ($tab === 'upcoming') {
+            $query->whereIn('status', ['draft', 'live']);
+        } elseif ($tab === 'finished') {
+            $query->where('status', 'finished');
+        } elseif ($tab === 'unlisted') {
+            $query->where('status', 'unlisted');
+        }
+
+        $events = $query->get()
             ->map(fn($e) => array_merge($e->toArray(), [
                 'total_raised' => $e->total_raised,
                 'donors_count' => $e->rounds()
@@ -46,8 +57,9 @@ class EventController extends Controller
             'description'   => 'nullable|string',
             'target_amount' => 'required|numeric|min:1',
             'rounds_count'  => 'required|integer|min:1|max:10',
-            'group_size'    => 'required|integer|min:2|max:10',
-            'started_at'    => 'nullable|date',
+            'group_size'    => 'required|integer|min:2|max:25',
+            'started_at'    => 'nullable|string',  // keep as-is, no tz conversion
+            'duration'      => 'nullable|string|max:5',
             'charity_link'  => 'nullable|string',
             'logo'          => 'nullable|image|max:2048',
             'images.*'      => 'nullable|image|max:2048',
@@ -84,6 +96,7 @@ class EventController extends Controller
             'rounds_count'  => $request->rounds_count,
             'group_size'    => $request->group_size,
             'started_at'    => $request->started_at,
+            'duration'      => $request->duration,
             'charity_link'  => $request->charity_link,
             'logo'          => $logoPath,
             'images'        => !empty($imagePaths) ? $imagePaths : null,
@@ -99,12 +112,14 @@ class EventController extends Controller
     public function show(Request $request, $id)
     {
         $event = Event::where('host_id', $request->user()->id)
-            ->with(['rounds.bids', 'rounds.groups.members.bid'])
+            ->with(['rounds.bids', 'rounds.groups'])
             ->findOrFail($id);
 
-        $currentRound    = $event->rounds
+        // Query currentRound fresh from DB with all nested relations
+        $currentRound = Round::where('event_id', $event->id)
             ->whereIn('status', ['waiting', 'open'])
-            ->sortBy('round_number')
+            ->orderBy('round_number')
+            ->with(['groups.members.bid', 'bids'])
             ->first();
 
         $completedRounds = $event->rounds->where('status', 'closed')->count();
@@ -137,58 +152,110 @@ class EventController extends Controller
         })->values();
 
         // ── Current groups ────────────────────────────────────────────
-        // Show formed groups if round closed, or flat bid list if open
         $currentGroups = [];
 
         if ($currentRound) {
-            if ($currentRound->status === 'open') {
-                // Round open — show flat bid list (groups not formed yet)
+            if ($currentRound->groups->count() > 0) {
+                // Groups exist — map each to a grid card
+                foreach ($currentRound->groups as $group) {
+                    // Every GroupMember has bid_id set at grouping time
+                    $memberCount = $group->members->count();
+                    $groupSize   = $event->group_size;
+
+                    // 'done' = group is full; 'pending' = still filling up
+                    $status = ($memberCount >= $groupSize) ? 'done' : 'pending';
+
+                    $members = $group->members->map(function ($member) {
+                        // pseudonym stored on GroupMember; amount via bid relationship
+                        $pseudonym = $member->pseudonym ?? '—';
+                        return [
+                            'group_member_id' => $member->id,                          // ← for move API
+                            'pseudonym'       => $pseudonym,
+                            'initial'         => strtoupper(substr($pseudonym, 0, 1)),
+                            'bid_amount'      => $member->bid
+                                ? '£' . number_format($member->bid->amount, 0)
+                                : null,
+                            'is_quit'         => (bool) ($member->is_quit ?? false),
+                            'total_committed' => null,
+                            'emoji'           => $member->emoji ?? null,               // ← for avatar display
+                        ];
+                    })->values();
+
+                    $currentGroups[] = [
+                        'id'         => $group->id,                                    // ← group DB id for move API
+                        'name'       => $group->group_name,
+                        'bids'       => $memberCount,
+                        'total_bids' => $groupSize,
+                        'min'        => $group->min_amount
+                            ? '£' . number_format($group->min_amount, 0)
+                            : null,
+                        'alert'      => false,
+                        'status'     => $status,
+                        'donors'     => $members,
+                    ];
+                }
+            } elseif ($currentRound->bids->count() > 0) {
+                // Bids placed but no groups formed yet — safety fallback placeholder
                 $donors = $currentRound->bids->map(function ($bid) {
+                    $pseudonym = $bid->pseudonym ?? '—';
                     return [
-                        'pseudonym'       => $bid->pseudonym ?? '—',
-                        'initial'         => strtoupper(substr($bid->pseudonym ?? '?', 0, 1)),
-                        'bid_amount'      => $bid->amount ? '£' . number_format($bid->amount, 0) : null,
+                        'pseudonym'       => $pseudonym,
+                        'initial'         => strtoupper(substr($pseudonym, 0, 1)),
+                        'bid_amount'      => $bid->amount
+                            ? '£' . number_format($bid->amount, 0)
+                            : null,
                         'is_quit'         => false,
                         'total_committed' => null,
                     ];
                 })->values();
 
-                if ($donors->count() > 0) {
-                    $currentGroups = [[
-                        'name'       => 'Round ' . $currentRound->round_number . ' Bids',
-                        'bids'       => $donors->count(),
-                        'total_bids' => $donors->count(),
-                        'min'        => null,
-                        'alert'      => false,
-                        'status'     => 'pending',
-                        'donors'     => $donors,
-                    ]];
-                }
+                $currentGroups = [[
+                    'name'       => 'Round ' . $currentRound->round_number . ' Bids',
+                    'bids'       => $donors->count(),
+                    'total_bids' => $donors->count(),
+                    'min'        => null,
+                    'alert'      => false,
+                    'status'     => 'pending',
+                    'donors'     => $donors,
+                ]];
             }
         } else {
-            // Show groups from the latest closed round
             $lastClosedRound = $event->rounds
                 ->where('status', 'closed')
                 ->sortByDesc('round_number')
                 ->first();
 
             if ($lastClosedRound) {
+                // Ensure members + bids loaded for last closed round
+                $lastClosedRound->load('groups.members.bid');
+
                 foreach ($lastClosedRound->groups as $group) {
+                    $memberCount = $group->members->count();
+                    $groupSize   = $event->group_size;
+
                     $members = $group->members->map(function ($member) {
+                        $pseudonym = $member->pseudonym ?? '—';
                         return [
-                            'pseudonym'       => $member->pseudonym ?? '—',
-                            'initial'         => strtoupper(substr($member->pseudonym ?? '?', 0, 1)),
-                            'bid_amount'      => $member->bid ? '£' . number_format($member->bid->amount, 0) : null,
-                            'is_quit'         => $member->is_quit ?? false,
+                            'group_member_id' => $member->id,                          // ← for move API
+                            'pseudonym'       => $pseudonym,
+                            'initial'         => strtoupper(substr($pseudonym, 0, 1)),
+                            'bid_amount'      => $member->bid
+                                ? '£' . number_format($member->bid->amount, 0)
+                                : null,
+                            'is_quit'         => (bool) ($member->is_quit ?? false),
                             'total_committed' => null,
+                            'emoji'           => $member->emoji ?? null,               // ← for avatar display
                         ];
                     })->values();
 
                     $currentGroups[] = [
+                        'id'         => $group->id,                                    // ← group DB id for move API
                         'name'       => $group->group_name,
-                        'bids'       => $group->members->count(),
-                        'total_bids' => $group->members->count(),
-                        'min'        => '£' . number_format($group->min_amount, 0),
+                        'bids'       => $memberCount,
+                        'total_bids' => $groupSize,
+                        'min'        => $group->min_amount
+                            ? '£' . number_format($group->min_amount, 0)
+                            : null,
                         'alert'      => false,
                         'status'     => 'done',
                         'donors'     => $members,
@@ -214,12 +281,14 @@ class EventController extends Controller
             'name'          => $event->name,
             'charity_name'  => $event->charity_name,
             'description'   => $event->description,
-            'logo'          => $event->logo,
             'target_amount' => $event->target_amount,
+            'logo'          => $event->logo,
+            'images'        => $event->images,
             'join_code'     => $event->join_code,
             'status'        => $event->status,
             'rounds_count'  => $event->rounds_count,
             'group_size'    => $event->group_size,
+            'duration'      => $event->duration,
             'charity_link'  => $event->charity_link,
             'started_at'    => $event->started_at,
             'ended_at'      => $event->ended_at ?? null,
@@ -232,7 +301,8 @@ class EventController extends Controller
                 'seconds' => (int) $currentRound->opened_at->diffInSeconds(now()),
             ] : null,
             'round_progress'  => $currentRound
-                ? '0/' . $currentRound->bids->count() . ' Complete'
+                ? $currentRound->groups->sum(fn($g) => $g->members->count())
+                  . '/' . ($currentRound->groups->count() * $event->group_size) . ' Complete'
                 : null,
             'active_alert'    => null,
             'current_groups'  => $currentGroups,
@@ -248,7 +318,7 @@ class EventController extends Controller
         $event->update($request->only([
             'name', 'charity_name', 'description',
             'target_amount', 'rounds_count', 'group_size',
-            'started_at', 'charity_link',
+            'started_at', 'duration', 'charity_link',
         ]));
         return response()->json($event);
     }
@@ -270,7 +340,6 @@ class EventController extends Controller
             'started_at' => $event->started_at ?? now(),
         ]);
 
-        // If started_at already passed and no rounds exist, open Round 1 immediately
         if ($event->started_at <= now() && $event->rounds()->count() === 0) {
             Round::create([
                 'event_id'     => $event->id,
@@ -289,6 +358,20 @@ class EventController extends Controller
         $event = Event::where('host_id', $request->user()->id)->findOrFail($id);
         $event->update(['status' => 'finished', 'ended_at' => now()]);
         return response()->json($event);
+    }
+
+    // POST /api/host/events/{id}/unlist
+    public function unlist(Request $request, $id)
+    {
+        $event = Event::where('host_id', $request->user()->id)->findOrFail($id);
+
+        if ($event->status === 'finished') {
+            return response()->json(['message' => 'Finished events cannot be unlisted.'], 422);
+        }
+
+        $event->update(['status' => 'unlisted']);
+
+        return response()->json(['message' => 'Event unlisted successfully.']);
     }
 
     // GET /api/host/events/{id}/donors
@@ -311,5 +394,116 @@ class EventController extends Controller
             $code = strtoupper(Str::random(8));
         } while (Event::where('join_code', $code)->exists());
         return $code;
+    }
+
+    // POST /api/host/events/{id}/next-round
+    public function nextRound(Request $request, $id)
+    {
+        $event = Event::where('host_id', $request->user()->id)
+            ->with(['rounds.bids'])
+            ->findOrFail($id);
+
+        if ($event->status !== 'live') {
+            return response()->json(['message' => 'Event is not live'], 422);
+        }
+
+        $currentRound = $event->rounds
+            ->whereIn('status', ['open', 'waiting'])
+            ->sortBy('round_number')
+            ->first();
+
+        if (!$currentRound) {
+            return response()->json(['message' => 'No active round found'], 422);
+        }
+
+        // ── Finalise groups before closing ──────────────────────────
+        app(GroupingService::class)->finaliseGroups($currentRound);
+
+        // Close the current round
+        $currentRound->update([
+            'status'    => 'closed',
+            'closed_at' => now(),
+        ]);
+
+        $nextRoundNumber = $currentRound->round_number + 1;
+
+        // All rounds done → auto-finish event
+        if ($nextRoundNumber > $event->rounds_count) {
+            $event->update(['status' => 'finished', 'ended_at' => now()]);
+            return response()->json([
+                'message'      => 'All rounds complete. Event finished.',
+                'event_status' => 'finished',
+            ]);
+        }
+
+        // Open next round
+        $nextRound = Round::create([
+            'event_id'     => $event->id,
+            'round_number' => $nextRoundNumber,
+            'status'       => 'open',
+            'opened_at'    => now(),
+        ]);
+
+        return response()->json([
+            'message'      => "Round {$nextRoundNumber} opened.",
+            'closed_round' => $currentRound->round_number,
+            'opened_round' => $nextRound->round_number,
+            'event_status' => 'live',
+        ]);
+    }
+
+    // POST /api/host/events/{id}/open-round
+    public function openRound(Request $request, $id)
+    {
+        $event = Event::where('host_id', $request->user()->id)->findOrFail($id);
+
+        if ($event->status !== 'live') {
+            return response()->json(['message' => 'Event is not live'], 422);
+        }
+
+        $hasOpenRound = $event->rounds()->whereIn('status', ['open', 'waiting'])->exists();
+
+        if ($hasOpenRound) {
+            return response()->json(['message' => 'A round is already open'], 422);
+        }
+
+        $lastRound  = $event->rounds()->orderByDesc('round_number')->first();
+        $nextNumber = $lastRound ? $lastRound->round_number + 1 : 1;
+
+        if ($nextNumber > $event->rounds_count) {
+            return response()->json(['message' => 'All rounds already completed'], 422);
+        }
+
+        $round = Round::create([
+            'event_id'     => $event->id,
+            'round_number' => $nextNumber,
+            'status'       => 'open',
+            'opened_at'    => now(),
+        ]);
+
+        return response()->json([
+            'message'      => "Round {$nextNumber} opened manually.",
+            'round_number' => $round->round_number,
+        ]);
+    }
+
+    // POST /api/host/events/{id}/repair-groups
+    public function repairGroups(Request $request, $id)
+    {
+        $grouping = app(\App\Services\GroupingService::class);
+        $event = Event::where('host_id', $request->user()->id)->findOrFail($id);
+
+        $round = Round::where('event_id', $event->id)
+            ->whereIn('status', ['open', 'waiting'])
+            ->orderBy('round_number')
+            ->first();
+
+        if (!$round) {
+            return response()->json(['message' => 'No open round found.'], 422);
+        }
+
+        $grouping->repairRound($round);
+
+        return response()->json(['message' => 'Groups repaired for round ' . $round->round_number]);
     }
 }

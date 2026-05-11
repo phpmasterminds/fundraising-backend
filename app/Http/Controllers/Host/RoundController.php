@@ -66,11 +66,11 @@ class RoundController extends Controller
         ]);
 
         // Run grouping algorithm — randomly assigns all bidders into groups
-        $groups = $this->grouping->formGroups($round, $event->group_size);
+        //$groups = $this->grouping->formGroups($round, $event->group_size);
 
         return response()->json([
             'round'  => $round,
-            'groups' => $groups,
+            //'groups' => $groups,
         ]);
     }
 

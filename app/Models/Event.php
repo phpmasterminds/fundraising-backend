@@ -16,14 +16,14 @@ class Event extends Model
         'rounds_count',
         'group_size',
         'started_at',
-        'ended_at',        // ← added
+        'duration',        // ← added (HH:MM string)
+        'ended_at',
         'charity_link',
         'logo',
         'images',
         'join_code',
-        'qr_code',         // ← added
+        'qr_code',
         'status',
-        // total_raised removed — it's a computed accessor, not a DB column
     ];
 
     protected $casts = [
@@ -32,7 +32,7 @@ class Event extends Model
         'rounds_count'  => 'integer',
         'group_size'    => 'integer',
         'started_at'    => 'datetime',
-        'ended_at'      => 'datetime',   // ← added
+        'ended_at'      => 'datetime',
     ];
 
     public function rounds(): HasMany
