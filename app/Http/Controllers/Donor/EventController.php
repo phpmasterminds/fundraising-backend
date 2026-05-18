@@ -50,7 +50,8 @@ class EventController extends Controller
             'charity_link' => $event->charity_link,
             'rounds_count' => (int) $event->rounds_count,
             'group_size'   => (int) $event->group_size,
-            'duration'     => $event->duration,             // ← added
+            'duration'     => $event->duration,
+            'round_time'   => (int) $event->round_time,
             'donors_count' => $this->countDonors((int) $event->id),
             'my_pseudonym' => $member?->pseudonym,
             'my_initial'   => $member ? mb_strtoupper(mb_substr($member->pseudonym, 0, 1)) : null,
@@ -80,10 +81,115 @@ class EventController extends Controller
                 'my_bid'         => null,
                 'my_cumulative'  => 0,
                 'round_bids'     => [],
+                'round_time'     => (int) $event->round_time,
+                'all_round_bids' => $this->getAllRoundBids($event->id, $user->id),
             ]);
         }
 
-        return response()->json($this->formatRoundState($round, $user, $event));
+        $data = $this->formatRoundState($round, $user, $event);
+        $data['round_time']     = (int) $event->round_time;
+        $data['all_round_bids'] = $this->getAllRoundBids($event->id, $user->id);
+
+        return response()->json($data);
+    }
+
+    /**
+     * GET /donor/events/{id}/round-status
+     *
+     * Lightweight polling endpoint called every 5 seconds by the donor app.
+     * Returns current round state so frontend can detect:
+     *   - Host opened next round early (round_status = 'open', current_round advanced)
+     *   - Event finished (round_status = 'finished')
+     *   - Still waiting between rounds (round_status = 'waiting')
+     */
+    public function roundStatus(Request $request, int $id): JsonResponse
+    {
+        $event = Event::findOrFail($id);
+
+        // Check for open round first
+        $openRound = $event->rounds()->where('status', 'open')->first();
+
+        if ($openRound) {
+            $durationSecs = $this->parseDuration($event->duration);
+            $secondsLeft  = null;
+
+            if ($openRound->opened_at && $durationSecs > 0) {
+                $elapsed     = (int) $openRound->opened_at->diffInSeconds(now());
+                $secondsLeft = max(0, $durationSecs - $elapsed);
+            }
+
+            return response()->json([
+                'event_status'       => $event->status,
+                'current_round'      => $openRound->round_number,
+                'round_status'       => 'open',
+                'seconds_left'       => $secondsLeft,
+                'seconds_until_next' => null,
+            ]);
+        }
+
+        // Check if event is finished
+        if ($event->status === 'finished') {
+            $lastRound = $event->rounds()->orderByDesc('round_number')->first();
+            return response()->json([
+                'event_status'       => 'finished',
+                'current_round'      => $lastRound?->round_number ?? (int) $event->rounds_count,
+                'round_status'       => 'finished',
+                'seconds_left'       => null,
+                'seconds_until_next' => null,
+            ]);
+        }
+
+        // No open round — find last closed round and check waiting period
+        $lastClosed = $event->rounds()
+            ->where('status', 'closed')
+            ->orderByDesc('round_number')
+            ->first();
+
+        // All rounds closed = finished
+        $allClosed = $event->rounds()->whereNotIn('status', ['closed'])->doesntExist();
+        if ($allClosed && $lastClosed) {
+            $event->update(['status' => 'finished']);
+            return response()->json([
+                'event_status'       => 'finished',
+                'current_round'      => $lastClosed->round_number,
+                'round_status'       => 'finished',
+                'seconds_left'       => null,
+                'seconds_until_next' => null,
+            ]);
+        }
+
+        // No more waiting rounds — all done
+        $hasWaitingRounds = $event->rounds()->where('status', 'waiting')->exists();
+        if (!$hasWaitingRounds) {
+            // Last round closed, no more rounds — mark finished if not already
+            if ($event->status !== 'finished') {
+                $event->update(['status' => 'finished']);
+            }
+            return response()->json([
+                'event_status'       => 'finished',
+                'current_round'      => $lastClosed?->round_number ?? (int) $event->rounds_count,
+                'round_status'       => 'finished',
+                'seconds_left'       => null,
+                'seconds_until_next' => null,
+            ]);
+        }
+
+        // Waiting between rounds — has more rounds to go
+        $roundTime        = (int) $event->round_time;
+        $secondsUntilNext = null;
+
+        if ($lastClosed && $lastClosed->closed_at && $roundTime > 0) {
+            $elapsed          = (int) $lastClosed->closed_at->diffInSeconds(now());
+            $secondsUntilNext = max(0, $roundTime - $elapsed);
+        }
+
+        return response()->json([
+            'event_status'       => $event->status,
+            'current_round'      => $lastClosed?->round_number ?? 0,
+            'round_status'       => 'waiting',
+            'seconds_left'       => null,
+            'seconds_until_next' => $secondsUntilNext,
+        ]);
     }
 
     // GET /events/join/{code}
@@ -140,6 +246,24 @@ class EventController extends Controller
 
     // ─── Private helpers ─────────────────────────────────────────
 
+    /**
+     * Returns all bids (active + pending) a donor has placed for this event.
+     * Used to show the donor their upcoming pending bids.
+     */
+    private function getAllRoundBids(int $eventId, int $userId): array
+    {
+        return Bid::where('event_id', $eventId)
+            ->where('user_id', $userId)
+            ->orderBy('scheduled_round_number')
+            ->get()
+            ->map(fn($b) => [
+                'round_number' => (int) $b->scheduled_round_number,
+                'amount'       => (int) $b->amount,
+                'status'       => $b->bid_status ?? 'active',
+            ])
+            ->toArray();
+    }
+
     private function findMember(int $eventId, int $userId): ?\App\Models\GroupMember
     {
         return \App\Models\GroupMember::where('event_id', $eventId)
@@ -179,25 +303,20 @@ class EventController extends Controller
         $myBid   = Bid::where('round_id', $round->id)->where('user_id', $user->id)->first();
         $allBids = Bid::where('round_id', $round->id)->orderBy('amount')->get();
 
-        // ── Timer: return SECONDS REMAINING (not elapsed) ─────────────
-        // Frontend does: countdown = seconds_left, ticks down.
         $secondsLeft = null;
         if ($round->status === 'open' && $round->opened_at) {
-            $durationSecs = $this->parseDuration($event->duration); // total round seconds
-            $elapsedSecs  = (int) $round->opened_at->diffInSeconds(now());
+            $durationSecs = $this->parseDuration($event->duration);
             if ($durationSecs > 0) {
+                $elapsedSecs = (int) $round->opened_at->diffInSeconds(now());
                 $secondsLeft = max(0, $durationSecs - $elapsedSecs);
-            } else {
-                // No duration set — just return elapsed so frontend can count up
-                $secondsLeft = $elapsedSecs;
             }
+            // If duration not set → null (no timer shown)
         }
 
         $roundBids     = [];
         $matchedAmount = null;
         $groupTotal    = null;
 
-        // ── Round bids: show for BOTH open and closed rounds ──────────
         if ($allBids->count() > 0) {
             $minAmount = (int) $allBids->min('amount');
 
@@ -220,18 +339,10 @@ class EventController extends Controller
         $cumulative = $this->calcCumulative((int) $event->id, (int) $user->id, $round->round_number);
         $groupSize  = (int) $event->group_size;
 
-        // ── Build my_group ─────────────────────────────────────────────
-        //
-        // CLOSED round → show THIS round's group (grouping just ran)
-        // OPEN round   → show PREVIOUS closed round's group with CURRENT
-        //                round bid statuses (shows who you're bidding with)
-        // Round 1 open → null (GroupCard shows "Waiting for others")
-
         $myGroup = null;
 
         if ($round->status === 'closed') {
             $myGroup = $this->buildMyGroup($event->id, $user->id, $round->id, $round->id);
-
         } elseif ($round->status === 'open') {
             $prevRound = Round::where('event_id', $event->id)
                 ->where('status', 'closed')
@@ -239,22 +350,11 @@ class EventController extends Controller
                 ->first();
 
             if ($prevRound) {
-                // Round 2+: show previous round's final group
-                $myGroup = $this->buildMyGroup(
-                    $event->id, $user->id, $prevRound->id, $round->id
-                );
+                $myGroup = $this->buildMyGroup($event->id, $user->id, $prevRound->id, $round->id);
             } else {
-                // Round 1 open: try assigned preview group first,
-                // fall back to predicted group by join order
-                $myGroup = $this->buildMyGroup(
-                    $event->id, $user->id, $round->id, $round->id
-                );
-
+                $myGroup = $this->buildMyGroup($event->id, $user->id, $round->id, $round->id);
                 if (!$myGroup) {
-                    // Donor hasn't bid yet — predict which group they'll be in
-                    $myGroup = $this->buildPredictedGroup(
-                        $event, $round, $user->id
-                    );
+                    $myGroup = $this->buildPredictedGroup($event, $round, $user->id);
                 }
             }
         }
@@ -275,12 +375,6 @@ class EventController extends Controller
         ];
     }
 
-    /**
-     * Builds the my_group payload.
-     *
-     * @param int $groupRoundId  closed round whose grouping to look up
-     * @param int $bidRoundId    round to check bid_status against (may differ during open round)
-     */
     private function buildMyGroup(int $eventId, int $userId, int $groupRoundId, int $bidRoundId): ?array
     {
         $member = \App\Models\GroupMember::where('event_id', $eventId)
@@ -289,13 +383,10 @@ class EventController extends Controller
             ->with(['group.members'])
             ->first();
 
-        if (!$member || !$member->group) {
-            return null;
-        }
+        if (!$member || !$member->group) return null;
 
         $group = $member->group;
 
-        // Who in this group has already bid in the current round?
         $bidsThisRound = Bid::where('round_id', $bidRoundId)
             ->whereIn('user_id', $group->members->pluck('user_id'))
             ->pluck('user_id')
@@ -311,41 +402,25 @@ class EventController extends Controller
             ];
         })->values()->toArray();
 
-        return [
-            'name'    => $group->group_name,
-            'members' => $members,
-        ];
+        return ['name' => $group->group_name, 'members' => $members];
     }
 
-    /**
-     * Predicts which group a donor will be in based on their
-     * sequential join position, even before they place a bid.
-     * Uses the same logic as GroupingService::assignOnBid().
-     */
     private function buildPredictedGroup(Event $event, Round $round, int $userId): ?array
     {
-        $groupSize = (int) $event->group_size;
-
-        // Get all members of this event ordered by join time
+        $groupSize  = (int) $event->group_size;
         $allMembers = \App\Models\GroupMember::where('event_id', $event->id)
-            ->orderBy('created_at', 'asc')
-            ->get();
+            ->orderBy('created_at', 'asc')->get();
 
-        // Find this user's 0-based position
         $position = $allMembers->search(fn($m) => $m->user_id === $userId);
         if ($position === false) return null;
 
-        $groupIndex  = (int) floor($position / $groupSize);
-        $groupLetter = chr(65 + $groupIndex); // A, B, C...
-
-        // Get all members in this predicted group slot
+        $groupIndex   = (int) floor($position / $groupSize);
+        $groupLetter  = chr(65 + $groupIndex);
         $groupMembers = $allMembers->slice($groupIndex * $groupSize, $groupSize)->values();
 
-        // Who has already bid in this round?
         $bidsThisRound = Bid::where('round_id', $round->id)
             ->whereIn('user_id', $groupMembers->pluck('user_id'))
-            ->pluck('user_id')
-            ->toArray();
+            ->pluck('user_id')->toArray();
 
         $members = $groupMembers->map(function ($m) use ($userId, $bidsThisRound) {
             return [
@@ -357,25 +432,9 @@ class EventController extends Controller
             ];
         })->values()->toArray();
 
-        return [
-            'name'    => 'Group ' . $groupLetter,
-            'members' => $members,
-        ];
+        return ['name' => 'Group ' . $groupLetter, 'members' => $members];
     }
 
-
-    private function getMyEventIds(int $userId): array
-    {
-        return \App\Models\GroupMember::where('user_id', $userId)
-            ->pluck('event_id')
-            ->unique()
-            ->toArray();
-    }
-
-    /**
-     * Parse "HH:MM" duration string → total seconds.
-     * Supports extended hours like "24:00" (1 day) or "48:00" (2 days).
-     */
     private function parseDuration(?string $duration): int
     {
         if (!$duration) return 0;

@@ -4,6 +4,8 @@ namespace App\Http\Controllers\Host;
 
 use App\Http\Controllers\Controller;
 use App\Models\Event;
+use App\Models\Group;
+use App\Models\GroupMember;
 use App\Models\Round;
 use Illuminate\Http\Request;
 use Illuminate\Support\Str;
@@ -60,6 +62,7 @@ class EventController extends Controller
             'group_size'    => 'required|integer|min:2|max:25',
             'started_at'    => 'nullable|string',  // keep as-is, no tz conversion
             'duration'      => 'nullable|string|max:5',
+            'round_time'    => 'nullable|integer|min:0',  // ← FIXED: was missing
             'charity_link'  => 'nullable|string',
             'logo'          => 'nullable|image|max:2048',
             'images.*'      => 'nullable|image|max:2048',
@@ -97,6 +100,7 @@ class EventController extends Controller
             'group_size'    => $request->group_size,
             'started_at'    => $request->started_at,
             'duration'      => $request->duration,
+            'round_time'    => $request->round_time,  // ← FIXED: was missing
             'charity_link'  => $request->charity_link,
             'logo'          => $logoPath,
             'images'        => !empty($imagePaths) ? $imagePaths : null,
@@ -289,6 +293,7 @@ class EventController extends Controller
             'rounds_count'  => $event->rounds_count,
             'group_size'    => $event->group_size,
             'duration'      => $event->duration,
+            'round_time'    => $event->round_time,   // ← included in show response
             'charity_link'  => $event->charity_link,
             'started_at'    => $event->started_at,
             'ended_at'      => $event->ended_at ?? null,
@@ -319,6 +324,7 @@ class EventController extends Controller
             'name', 'charity_name', 'description',
             'target_amount', 'rounds_count', 'group_size',
             'started_at', 'duration', 'charity_link',
+            'round_time',  // ← FIXED: was missing from update
         ]));
         return response()->json($event);
     }
@@ -340,12 +346,24 @@ class EventController extends Controller
             'started_at' => $event->started_at ?? now(),
         ]);
 
-        if ($event->started_at <= now() && $event->rounds()->count() === 0) {
-            Round::create([
-                'event_id'     => $event->id,
-                'round_number' => 1,
-                'status'       => 'open',
-                'opened_at'    => now(),
+        // Pre-create ALL rounds as 'waiting' if not already created
+        if ($event->rounds()->count() === 0) {
+            $totalRounds = (int) $event->rounds_count;
+
+            for ($i = 1; $i <= $totalRounds; $i++) {
+                Round::create([
+                    'event_id'     => $event->id,
+                    'round_number' => $i,
+                    'status'       => 'waiting',
+                    'opened_at'    => null,
+                    'closed_at'    => null,
+                ]);
+            }
+
+            // Open Round 1 immediately
+            $event->rounds()->where('round_number', 1)->first()->update([
+                'status'    => 'open',
+                'opened_at' => now(),
             ]);
         }
 
@@ -388,12 +406,38 @@ class EventController extends Controller
         return response()->json($donors);
     }
 
-    private function generateJoinCode(): string
+    // POST /api/host/events/{eventId}/groups/{fromGroupId}/move-members
+    public function moveMembers(Request $request, $eventId, $fromGroupId)
     {
-        do {
-            $code = strtoupper(Str::random(8));
-        } while (Event::where('join_code', $code)->exists());
-        return $code;
+        $event = Event::where('host_id', $request->user()->id)->findOrFail($eventId);
+
+        $request->validate([
+            'to_group_id'      => 'required|integer',
+            'group_member_ids' => 'required|array|min:1',
+            'group_member_ids.*' => 'integer',
+        ]);
+
+        $toGroupId       = $request->to_group_id;
+        $groupMemberIds  = $request->group_member_ids;
+
+        // Verify both groups belong to this event
+        $fromGroup = Group::where('id', $fromGroupId)
+            ->where('event_id', $event->id)
+            ->firstOrFail();
+
+        $toGroup = Group::where('id', $toGroupId)
+            ->where('event_id', $event->id)
+            ->firstOrFail();
+
+        // Move each GroupMember to the target group
+        $moved = GroupMember::whereIn('id', $groupMemberIds)
+            ->where('group_id', $fromGroup->id)
+            ->update(['group_id' => $toGroup->id]);
+
+        return response()->json([
+            'message'     => 'Members moved successfully.',
+            'moved_count' => $moved,
+        ]);
     }
 
     // POST /api/host/events/{id}/next-round
@@ -505,5 +549,13 @@ class EventController extends Controller
         $grouping->repairRound($round);
 
         return response()->json(['message' => 'Groups repaired for round ' . $round->round_number]);
+    }
+
+    private function generateJoinCode(): string
+    {
+        do {
+            $code = strtoupper(Str::random(8));
+        } while (Event::where('join_code', $code)->exists());
+        return $code;
     }
 }

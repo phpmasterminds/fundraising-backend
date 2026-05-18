@@ -23,8 +23,15 @@ class BidController extends Controller
     /**
      * POST /donor/events/{id}/bid
      * Body: { amount: int }
-     * Submits or updates a bid for the currently open round,
-     * then assigns the donor to a group sequentially.
+     *
+     * Donors can ONLY bid on currently OPEN rounds.
+     * The round lifecycle is controlled by scheduler + host:
+     *   - Scheduler opens Round 1 at started_at
+     *   - Scheduler closes rounds when duration expires (opened_at + duration)
+     *   - Scheduler opens next round after round_time waiting period (closed_at + round_time)
+     *   - Host can also open/close rounds manually anytime
+     *
+     * If no round is open → return error. Donor must wait.
      */
     public function store(Request $request, $id)
     {
@@ -32,21 +39,19 @@ class BidController extends Controller
         $user  = $request->user();
 
         $validated = $request->validate([
-            'amount' => ['required', 'integer', 'min:0'],
+            'amount' => ['required', 'integer', 'min:1'],
         ]);
 
-        // Get the currently open round for this event
         $round = Round::where('event_id', $event->id)
             ->where('status', 'open')
             ->first();
 
         if (!$round) {
             throw ValidationException::withMessages([
-                'amount' => 'No round is currently open for this event.',
+                'amount' => 'No round is currently open. Please wait for the next round.',
             ]);
         }
 
-        // One bid per donor per round — update if already placed
         $isNewBid = !Bid::where('round_id', $round->id)
             ->where('user_id', $user->id)
             ->exists();
@@ -57,32 +62,33 @@ class BidController extends Controller
                 'user_id'  => $user->id,
             ],
             [
-                'amount'    => $validated['amount'],
-                'pseudonym' => $user->pseudonym ?? $user->name ?? 'Anonymous',
+                'event_id'               => $event->id,
+                'scheduled_round_number' => $round->round_number,
+                'bid_status'             => 'active',
+                'amount'                 => $validated['amount'],
+                'pseudonym'              => $user->pseudonym ?? $user->name ?? 'Anonymous',
             ]
         );
 
-        // ── Assign to group on first bid submission only ──────────────
-        // If donor updates their bid, they stay in the same group.
-        // New donor → assign to next available group slot.
         if ($isNewBid) {
             $this->grouping->assignOnBid($round, $user->id, $bid->id);
         } else {
-            // Still update min_amount on their existing group
             $this->grouping->updateGroupMin($round, $user->id);
         }
 
         return response()->json([
-            'success'  => true,
-            'bid_id'   => $bid->id,
-            'round_id' => $round->id,
-            'amount'   => (int) $bid->amount,
+            'success'       => true,
+            'bid_id'        => $bid->id,
+            'round_id'      => $round->id,
+            'round_number'  => $round->round_number,
+            'amount'        => (int) $bid->amount,
+            'bid_status'    => 'active',
+            'message'       => 'Bid placed for Round ' . $round->round_number . '.',
         ]);
     }
 
     /**
      * POST /donor/events/{id}/quit
-     * Donor opts out of further rounds.
      */
     public function quit(Request $request, $id)
     {

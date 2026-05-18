@@ -9,14 +9,17 @@ class Bid extends Model
 {
     protected $fillable = [
         'event_id',
-        'round_id',
+        'round_id',               // null for pending bids (round not yet open)
+        'scheduled_round_number', // which round number this bid targets (1-based)
+        'bid_status',             // 'pending' | 'active'
         'user_id',
         'amount',
-		'pseudonym'
+        'pseudonym',
     ];
 
     protected $casts = [
-        'amount' => 'integer',
+        'amount'                 => 'integer',
+        'scheduled_round_number' => 'integer',
     ];
 
     public function event(): BelongsTo

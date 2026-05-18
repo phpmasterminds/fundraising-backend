@@ -16,7 +16,8 @@ class Event extends Model
         'rounds_count',
         'group_size',
         'started_at',
-        'duration',        // ← added (HH:MM string)
+        'duration',        // HH:MM — how long each round lasts
+        'round_time',      // seconds — waiting period between rounds
         'ended_at',
         'charity_link',
         'logo',
@@ -31,6 +32,7 @@ class Event extends Model
         'target_amount' => 'integer',
         'rounds_count'  => 'integer',
         'group_size'    => 'integer',
+        'round_time'    => 'integer',
         'started_at'    => 'datetime',
         'ended_at'      => 'datetime',
     ];
