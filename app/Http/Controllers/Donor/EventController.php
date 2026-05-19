@@ -105,6 +105,20 @@ class EventController extends Controller
     public function roundStatus(Request $request, int $id): JsonResponse
     {
         $event = Event::findOrFail($id);
+        $user  = $request->user();
+
+        // Check if donor has already paid
+        $paymentStatus = 'unpaid';
+        if (\Illuminate\Support\Facades\Schema::hasColumn('group_members', 'payment_status')) {
+            $paid = \Illuminate\Support\Facades\DB::table('group_members')
+                ->join('groups', 'group_members.group_id', '=', 'groups.id')
+                ->join('rounds', 'groups.round_id', '=', 'rounds.id')
+                ->where('rounds.event_id', $event->id)
+                ->where('group_members.user_id', $user->id)
+                ->where('group_members.payment_status', 'paid_offline')
+                ->exists();
+            if ($paid) $paymentStatus = 'paid';
+        }
 
         // Check for open round first
         $openRound = $event->rounds()->where('status', 'open')->first();
@@ -124,6 +138,7 @@ class EventController extends Controller
                 'round_status'       => 'open',
                 'seconds_left'       => $secondsLeft,
                 'seconds_until_next' => null,
+                'payment_status'     => $paymentStatus,
             ]);
         }
 
@@ -136,6 +151,7 @@ class EventController extends Controller
                 'round_status'       => 'finished',
                 'seconds_left'       => null,
                 'seconds_until_next' => null,
+                'payment_status'     => $paymentStatus,
             ]);
         }
 
@@ -155,6 +171,7 @@ class EventController extends Controller
                 'round_status'       => 'finished',
                 'seconds_left'       => null,
                 'seconds_until_next' => null,
+                'payment_status'     => $paymentStatus,
             ]);
         }
 
@@ -171,6 +188,7 @@ class EventController extends Controller
                 'round_status'       => 'finished',
                 'seconds_left'       => null,
                 'seconds_until_next' => null,
+                'payment_status'     => $paymentStatus,
             ]);
         }
 
@@ -189,6 +207,7 @@ class EventController extends Controller
             'round_status'       => 'waiting',
             'seconds_left'       => null,
             'seconds_until_next' => $secondsUntilNext,
+            'payment_status'     => $paymentStatus,
         ]);
     }
 
@@ -336,7 +355,7 @@ class EventController extends Controller
             }
         }
 
-        $cumulative = $this->calcCumulative((int) $event->id, (int) $user->id, $round->round_number);
+        $cumulative = $this->calcCumulative((int) $event->id, (int) $user->id, $round->round_number, $round->status, $round->id);
         $groupSize  = (int) $event->group_size;
 
         $myGroup = null;
@@ -442,15 +461,53 @@ class EventController extends Controller
         return ($hh * 60 + $mm) * 60;
     }
 
-    private function calcCumulative(int $eventId, int $userId, int $upToRound): int
+    private function calcCumulative(int $eventId, int $userId, int $upToRound, string $currentStatus = 'closed', ?int $currentRoundId = null): int
     {
+        // Sum the matched amount (group min) for each CLOSED round the donor participated in
         $closedRounds = Round::where('event_id', $eventId)
             ->where('status', 'closed')
             ->where('round_number', '<=', $upToRound)
             ->pluck('id');
 
-        return (int) Bid::whereIn('round_id', $closedRounds)
-            ->where('user_id', $userId)
-            ->sum('amount');
+        $total = 0;
+
+        foreach ($closedRounds as $roundId) {
+            // Find the donor's group for this round
+            $group = \Illuminate\Support\Facades\DB::table('group_members')
+                ->join('groups', 'group_members.group_id', '=', 'groups.id')
+                ->where('groups.round_id', $roundId)
+                ->where('group_members.user_id', $userId)
+                ->select('groups.id as group_id', 'groups.min_amount')
+                ->first();
+
+            if (!$group) continue;
+
+            // Always recalculate from actual bids — don't trust groups.min_amount
+            // which can be stale or incorrect
+            $memberIds = \Illuminate\Support\Facades\DB::table('group_members')
+                ->where('group_id', $group->group_id)
+                ->pluck('user_id');
+
+            $minBid = Bid::where('round_id', $roundId)
+                ->whereIn('user_id', $memberIds)
+                ->min('amount');
+
+            if ($minBid) {
+                $total += (int) $minBid;
+            } elseif ($group->min_amount !== null) {
+                // Fallback to stored value if no bids found
+                $total += (int) $group->min_amount;
+            }
+        }
+
+        // If current round is still open, add its live min bid as a preview
+        if ($currentStatus === 'open' && $currentRoundId) {
+            $liveBids = Bid::where('round_id', $currentRoundId)->pluck('amount');
+            if ($liveBids->isNotEmpty()) {
+                $total += (int) $liveBids->min();
+            }
+        }
+
+        return $total;
     }
 }

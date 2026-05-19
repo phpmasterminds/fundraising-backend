@@ -32,6 +32,7 @@ class BidController extends Controller
      *   - Host can also open/close rounds manually anytime
      *
      * If no round is open → return error. Donor must wait.
+     * If donor has already paid → return error. No further bidding allowed.
      */
     public function store(Request $request, $id)
     {
@@ -41,6 +42,21 @@ class BidController extends Controller
         $validated = $request->validate([
             'amount' => ['required', 'integer', 'min:1'],
         ]);
+
+        // Block bidding if donor has already marked payment as paid
+        $hasPaid = DB::table('group_members')
+            ->join('groups', 'group_members.group_id', '=', 'groups.id')
+            ->join('rounds', 'groups.round_id', '=', 'rounds.id')
+            ->where('rounds.event_id', $event->id)
+            ->where('group_members.user_id', $user->id)
+            ->where('group_members.payment_status', 'paid_offline')
+            ->exists();
+
+        if ($hasPaid) {
+            throw ValidationException::withMessages([
+                'amount' => 'You have already completed payment for this event.',
+            ]);
+        }
 
         $round = Round::where('event_id', $event->id)
             ->where('status', 'open')

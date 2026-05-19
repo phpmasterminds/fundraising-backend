@@ -22,8 +22,9 @@ class PaymentController extends Controller
         $event = \App\Models\Event::findOrFail($id);
         $user = $request->user();
 
+        // Include both closed AND open rounds — last round may still be 'open' when payment is triggered
         $closedRounds = Round::where('event_id', $event->id)
-            ->where('status', 'closed')
+            ->whereIn('status', ['closed', 'open'])
             ->orderBy('round_number')
             ->get();
 
@@ -41,32 +42,50 @@ class PaymentController extends Controller
 
             if (!$group) continue;
 
-            // Use stored min_amount — the authoritative matched amount
-            if ($group->min_amount !== null) {
+            // Always recalculate from actual bids for this round — don't trust groups.min_amount
+            // which can be stale or incorrect if GroupingService stored wrong values
+            $memberIds = DB::table('group_members')
+                ->where('group_id', $group->group_id)
+                ->pluck('user_id');
+
+            $matched = (int) (Bid::where('round_id', $round->id)
+                ->whereIn('user_id', $memberIds)
+                ->min('amount') ?? 0);
+
+            // If no bids found for group members, fall back to groups.min_amount
+            if ($matched === 0 && $group->min_amount !== null) {
                 $matched = (int) $group->min_amount;
-            } else {
-                // Fallback: calculate from bids
-                $memberIds = DB::table('group_members')
-                    ->where('group_id', $group->group_id)
-                    ->pluck('user_id');
-                $matched = (int) (Bid::where('round_id', $round->id)
-                    ->whereIn('user_id', $memberIds)
-                    ->min('amount') ?? 0);
             }
 
             $totalAmount += $matched;
             $roundsDetail[] = ['round' => $round->round_number, 'matched' => $matched];
         }
 
+        // Check current payment status
+        $paymentStatus = 'unpaid';
+        if (Schema::hasColumn('group_members', 'payment_status')) {
+            $status = DB::table('group_members')
+                ->join('groups', 'group_members.group_id', '=', 'groups.id')
+                ->join('rounds', 'groups.round_id', '=', 'rounds.id')
+                ->where('rounds.event_id', $event->id)
+                ->where('group_members.user_id', $user->id)
+                ->value('group_members.payment_status');
+
+            if ($status === 'paid_offline') {
+                $paymentStatus = 'paid';
+            }
+        }
+
         return response()->json([
-            'donor_name'    => $user->name,
-            'total_amount'  => $totalAmount,
-            'event_name'    => $event->name,
-            'charity_name'  => $event->charity_name,
-            'charity_link'  => $event->charity_link,
-            'reference'     => 'PF-' . now()->format('Y') . '-' . strtoupper(Str::random(8)),
-            'date'          => now()->format('j M Y'),
-            'rounds_detail' => $roundsDetail,
+            'donor_name'     => $user->name,
+            'total_amount'   => $totalAmount,
+            'event_name'     => $event->name,
+            'charity_name'   => $event->charity_name,
+            'charity_link'   => $event->charity_link,
+            'reference'      => 'PF-' . now()->format('Y') . '-' . strtoupper(Str::random(8)),
+            'date'           => now()->format('j M Y'),
+            'rounds_detail'  => $roundsDetail,
+            'payment_status' => $paymentStatus,
         ]);
     }
 
