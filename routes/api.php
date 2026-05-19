@@ -20,6 +20,7 @@ Route::get('/events/join/{code}', [DonorEventController::class, 'joinByCode']);
 Route::middleware('auth:sanctum')->group(function () {
     Route::put('/profile',          [UserController::class, 'update']);
     Route::put('/profile/password', [UserController::class, 'changePassword']);
+    Route::get('/profile/stats',    [UserController::class, 'stats']);       // ← NEW
     Route::post('/auth/logout',     [AuthController::class, 'logout']);
     Route::get('/user',             [AuthController::class, 'me']);
     Route::post('/upload-avatar',   [UserController::class, 'uploadAvatar'])->middleware('auth:sanctum');
@@ -49,7 +50,7 @@ Route::middleware('auth:sanctum')->group(function () {
         Route::get('events/{id}',                     [DonorEventController::class, 'show']);
         Route::get('events/{id}/group',               [DonorEventController::class, 'myGroup']);
         Route::get('events/{id}/round-status',        [DonorEventController::class, 'roundStatus']);
-        Route::post('events/{id}/rounds/advance',     [DonorEventController::class, 'advanceRound']); // ← NEW
+        Route::post('events/{id}/rounds/advance',     [DonorEventController::class, 'advanceRound']);
 
         // Bidding
         Route::post('events/{id}/bids/bulk',          [BidController::class, 'storeBulk']);
