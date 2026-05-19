@@ -23,7 +23,6 @@ class EventController extends Controller
         $tab = $request->query('tab', 'upcoming');
 
         $query = Event::where('host_id', $request->user()->id)
-            ->withCount('rounds')
             ->latest();
 
         if ($tab === 'upcoming') {
