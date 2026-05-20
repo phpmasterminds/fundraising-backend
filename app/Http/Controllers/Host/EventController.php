@@ -222,7 +222,11 @@ class EventController extends Controller
                     'donors'     => $donors,
                 ]];
             }
-        } else {
+        }
+
+        // ── Fallback: if current round has no groups/bids yet, show last closed round's groups ──
+        // This covers the waiting period between rounds (round N+1 is open but empty).
+        if (empty($currentGroups)) {
             $lastClosedRound = $event->rounds
                 ->where('status', 'closed')
                 ->sortByDesc('round_number')
@@ -239,7 +243,7 @@ class EventController extends Controller
                     $members = $group->members->map(function ($member) {
                         $pseudonym = $member->pseudonym ?? '—';
                         return [
-                            'group_member_id' => $member->id,                          // ← for move API
+                            'group_member_id' => $member->id,
                             'pseudonym'       => $pseudonym,
                             'initial'         => strtoupper(substr($pseudonym, 0, 1)),
                             'bid_amount'      => $member->bid
@@ -247,12 +251,12 @@ class EventController extends Controller
                                 : null,
                             'is_quit'         => (bool) ($member->is_quit ?? false),
                             'total_committed' => null,
-                            'emoji'           => $member->emoji ?? null,               // ← for avatar display
+                            'emoji'           => $member->emoji ?? null,
                         ];
                     })->values();
 
                     $currentGroups[] = [
-                        'id'         => $group->id,                                    // ← group DB id for move API
+                        'id'         => $group->id,
                         'name'       => $group->group_name,
                         'bids'       => $memberCount,
                         'total_bids' => $groupSize,

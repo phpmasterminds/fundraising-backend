@@ -15,15 +15,15 @@ class PaymentController extends Controller
 {
     /**
      * GET /donor/events/{event}/payment
-     * Schema: group_members → groups(round_id, min_amount, total_amount) → rounds(event_id)
+     * Each donor pays their OWN bid per round (not the group minimum).
      */
     public function summary(Request $request, $id)
     {
         $event = \App\Models\Event::findOrFail($id);
-        $user = $request->user();
+        $user  = $request->user();
 
         // Include both closed AND open rounds — last round may still be 'open' when payment is triggered
-        $closedRounds = Round::where('event_id', $event->id)
+        $rounds = Round::where('event_id', $event->id)
             ->whereIn('status', ['closed', 'open'])
             ->orderBy('round_number')
             ->get();
@@ -31,32 +31,16 @@ class PaymentController extends Controller
         $roundsDetail = [];
         $totalAmount  = 0;
 
-        foreach ($closedRounds as $round) {
-            // Find donor's group for this round
-            $group = DB::table('group_members')
-                ->join('groups', 'group_members.group_id', '=', 'groups.id')
-                ->where('groups.round_id', $round->id)
-                ->where('group_members.user_id', $user->id)
-                ->select('groups.id as group_id', 'groups.min_amount', 'groups.total_amount')
+        foreach ($rounds as $round) {
+            // Get THIS donor's own latest bid for this round
+            $bid = Bid::where('round_id', $round->id)
+                ->where('user_id', $user->id)
+                ->orderBy('id', 'desc')  // latest bid if multiple rows exist
                 ->first();
 
-            if (!$group) continue;
+            if (!$bid) continue;
 
-            // Always recalculate from actual bids for this round — don't trust groups.min_amount
-            // which can be stale or incorrect if GroupingService stored wrong values
-            $memberIds = DB::table('group_members')
-                ->where('group_id', $group->group_id)
-                ->pluck('user_id');
-
-            $matched = (int) (Bid::where('round_id', $round->id)
-                ->whereIn('user_id', $memberIds)
-                ->min('amount') ?? 0);
-
-            // If no bids found for group members, fall back to groups.min_amount
-            if ($matched === 0 && $group->min_amount !== null) {
-                $matched = (int) $group->min_amount;
-            }
-
+            $matched      = (int) $bid->amount;
             $totalAmount += $matched;
             $roundsDetail[] = ['round' => $round->round_number, 'matched' => $matched];
         }
@@ -69,6 +53,7 @@ class PaymentController extends Controller
                 ->join('rounds', 'groups.round_id', '=', 'rounds.id')
                 ->where('rounds.event_id', $event->id)
                 ->where('group_members.user_id', $user->id)
+                ->orderBy('rounds.round_number', 'desc')
                 ->value('group_members.payment_status');
 
             if ($status === 'paid_offline') {
@@ -95,20 +80,20 @@ class PaymentController extends Controller
     public function markPaid(Request $request, $id)
     {
         $event = \App\Models\Event::findOrFail($id);
-        $user = $request->user();
+        $user  = $request->user();
 
-        // Only update payment_status if column exists (added by migration)
         if (Schema::hasColumn('group_members', 'payment_status')) {
-            $groupId = DB::table('group_members')
+            // Get all group_ids for this user across all rounds of this event
+            $groupIds = DB::table('group_members')
                 ->join('groups', 'group_members.group_id', '=', 'groups.id')
-                ->join('rounds', 'groups.round_id',        '=', 'rounds.id')
+                ->join('rounds', 'groups.round_id', '=', 'rounds.id')
                 ->where('rounds.event_id', $event->id)
                 ->where('group_members.user_id', $user->id)
-                ->value('group_members.group_id');
+                ->pluck('group_members.group_id');
 
-            if ($groupId) {
+            if ($groupIds->isNotEmpty()) {
                 DB::table('group_members')
-                    ->where('group_id', $groupId)
+                    ->whereIn('group_id', $groupIds)
                     ->where('user_id', $user->id)
                     ->update(['payment_status' => 'paid_offline']);
             }
