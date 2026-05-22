@@ -31,7 +31,7 @@ class GroupingService
 
         foreach ($chunks as $chunk) {
             $minAmount   = (int) $chunk->min('amount');
-            $totalAmount = $chunk->count() * $minAmount;
+            $totalAmount = (int) $chunk->sum('amount');
             $count       = $chunk->count();
             $matchRatio  = '1:' . ($count - 1);
 
